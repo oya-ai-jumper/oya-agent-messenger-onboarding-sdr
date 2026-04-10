@@ -1,17 +1,28 @@
 import os
-import sys
 import json
 import httpx
 import psycopg2
 import psycopg2.extras
 
-# Safely reconfigure stdout to UTF-8
-try:
-    sys.stdout.reconfigure(encoding="utf-8")
-except AttributeError:
-    pass
-
-print(f"A2ABASEAI_FILE: script.py")
+def _out(data: dict):
+    """Write JSON output directly to stdout fd — safe in ASCII-only oya sandbox."""
+    try:
+        s = json.dumps(data, ensure_ascii=True, default=str)
+        os.write(1, (s + "\n").encode("ascii", errors="replace"))
+    except Exception:
+        def _sanitize(obj):
+            if isinstance(obj, str):
+                return obj.encode("ascii", errors="replace").decode("ascii")
+            if isinstance(obj, dict):
+                return {_sanitize(k): _sanitize(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [_sanitize(i) for i in obj]
+            return obj
+        try:
+            s = json.dumps(_sanitize(data), default=str)
+            os.write(1, (s + "\n").encode("ascii", errors="replace"))
+        except Exception:
+            os.write(1, b'{"error": "output_failed"}\n')
 
 XANO_MCP_STREAM = "https://xktx-zdsw-4yq2.n7.xano.io/x2/mcp/hEfoWGi_/mcp/stream"
 RETOOL_DB_URL = os.environ.get(
@@ -23,7 +34,7 @@ RETOOL_DB_URL = os.environ.get(
 LOGIN_LINK_MESSAGE = (
     "It looks like your business already has an active Jumper Local account! "
     "You can sign in here: https://local.jumpermedia.co/signin\n\n"
-    "If you need any help, feel free to reach out to our support team. \U0001f60a"
+    "If you need any help, feel free to reach out to our support team."
 )
 
 REACTIVATION_LINK_MESSAGE = (
@@ -31,7 +42,7 @@ REACTIVATION_LINK_MESSAGE = (
     "but your plan is no longer active.\n\n"
     "To reactivate your GMB and get your Google rankings back on track, you can schedule "
     "a call with our team here: https://calendly.com/jmpsales/google-ranking-increase-jumper-local\n\n"
-    "We'd love to help you get started again! \U0001f60a"
+    "We'd love to help you get started again!"
 )
 
 MCP_PROTOCOL_VERSION = "2024-11-05"
@@ -43,23 +54,47 @@ MCP_CLIENT_VERSION = "1.0.0"
 # Retool DB — resolve place_id → email
 # ---------------------------------------------------------------------------
 
-def get_email_by_place_id(place_id: str) -> str | None:
-    """Look up the customer email in Retool by Google place_id."""
+def get_email_from_retool(place_id: str = None, address: str = None, name: str = None) -> str | None:
+    """
+    Look up customer email in Retool DB.
+    Priority: place_id → address → business name.
+    """
     try:
         conn = psycopg2.connect(RETOOL_DB_URL, connect_timeout=15)
         try:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute(
-                    "SELECT email FROM backfill_gmbs_names_and_other "
-                    "WHERE place_id = %s AND email IS NOT NULL LIMIT 1",
-                    (place_id,),
-                )
-                row = cur.fetchone()
-                return row["email"] if row else None
+                if place_id:
+                    cur.execute(
+                        "SELECT email FROM backfill_gmbs_names_and_other "
+                        "WHERE place_id = %s AND email IS NOT NULL LIMIT 1",
+                        (place_id,),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        return row["email"]
+                if address:
+                    cur.execute(
+                        "SELECT email FROM backfill_gmbs_names_and_other "
+                        "WHERE address ILIKE %s AND email IS NOT NULL LIMIT 1",
+                        (f"%{address.strip()}%",),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        return row["email"]
+                if name:
+                    cur.execute(
+                        "SELECT email FROM backfill_gmbs_names_and_other "
+                        "WHERE business_name ILIKE %s AND email IS NOT NULL LIMIT 1",
+                        (f"%{name.strip()}%",),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        return row["email"]
         finally:
             conn.close()
     except Exception:
         return None
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -152,14 +187,21 @@ def _parse_sse(text: str) -> dict:
 
 def do_check_customer(api_key: str, inp: dict) -> dict:
     place_id = inp.get("place_id", "").strip()
-    if not place_id:
-        return {"error": "place_id is required"}
+    address = (inp.get("formatted_address") or inp.get("address") or "").strip()
+    name = (inp.get("name") or inp.get("business_name") or "").strip()
 
-    # Step 1: resolve place_id → email via Retool DB
-    email = inp.get("email", "").strip() or get_email_by_place_id(place_id)
+    if not place_id and not address and not name:
+        return {"error": "Provide at least one of: place_id, formatted_address, name"}
+
+    # Step 1: resolve email via Retool DB — place_id → address → name
+    email = inp.get("email", "").strip() or get_email_from_retool(
+        place_id=place_id or None,
+        address=address or None,
+        name=name or None,
+    )
 
     if not email:
-        # Not in Retool DB — definitely a new lead
+        # Not in Retool DB — treat as new lead
         return {"status": "new_lead"}
 
     # Step 2: look up in Xano by email
@@ -202,7 +244,7 @@ try:
     else:
         result = {"error": f"Unknown action '{action}'. Available actions: check_customer"}
 
-    print(json.dumps(result, ensure_ascii=True))
+    _out(result)
 
 except Exception as e:
-    print(json.dumps({"error": str(e)}, ensure_ascii=True))
+    _out({"error": str(e)})

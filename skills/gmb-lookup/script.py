@@ -125,9 +125,17 @@ def do_details(key, inp):
 
 
 try:
-    key = os.environ.get("GOOGLE_PLACES_API_KEY", "").strip()
+    key = (
+        os.environ.get("GOOGLE_PLACES_API_KEY")
+        or os.environ.get("GOOGLE_MAPS_API_KEY")
+        or os.environ.get("PLACES_API_KEY")
+        or ""
+    ).strip()
     if not key:
-        raise Exception("GOOGLE_PLACES_API_KEY environment variable is not set")
+        raise Exception(
+            "Google Places API key not found. Set GOOGLE_PLACES_API_KEY, "
+            "GOOGLE_MAPS_API_KEY, or PLACES_API_KEY environment variable."
+        )
 
     inp = json.loads(os.environ.get("INPUT_JSON", "{}"))
     action = inp.get("action", "").strip()

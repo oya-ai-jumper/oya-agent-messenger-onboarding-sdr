@@ -51,29 +51,23 @@ def normalise_place_result(raw: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 HOURS_MSG = (
-    "Before we move forward, I noticed your Google listing is missing business hours. "
-    "You'll need to add those to your GMB profile first — once you've done that, come back "
-    "and let me know and I'll pick up right where we left off! 🙌"
+    "Looks like your Google Business Profile doesn't meet all of our requirements. "
+    "Please add business hours to your profile and try again."
 )
 
 WEBSITE_MSG = (
-    "Thanks for confirming! Unfortunately, our program is currently only available to businesses "
-    "with an active website linked to their Google listing. If you get a website set up, "
-    "we'd love to have you back! 😊"
+    "Looks like your Google Business Profile doesn't meet all of our requirements. "
+    "Please add a website to your profile and try again."
 )
 
 REVIEWS_MSG_TEMPLATE = (
-    "Thanks! One thing — our program requires at least 10 Google reviews to get started, "
-    "and your listing currently has {review_count}. A few things that can help: ask recent "
-    "customers directly, add a review link to your email signature, or share it on social media. "
-    "Once you hit 10, come back and we'll get you set up! ⭐"
+    "Looks like your Google Business Profile doesn't meet all of our requirements. "
+    "We need to see at least 10 reviews on your profile."
 )
 
 RATING_MSG_TEMPLATE = (
-    "Thanks for confirming! At the moment, our program requires a Google rating above 3.0, "
-    "and yours is currently {rating}. The best way to bring it up is by responding to existing "
-    "reviews and encouraging happy customers to share their experience. "
-    "Once your rating improves, we'd love to work with you! 🙏"
+    "Looks like your Google Business Profile doesn't meet all of our requirements. "
+    "We need to see at least a 3.0 or higher rating on your Google Business Profile."
 )
 
 
@@ -111,7 +105,7 @@ def run_qualification_checks(gmb_data: dict) -> dict:
             "action_required": "send_message",
             "failed_check": "review_count",
             "end_conversation": True,
-            "message": REVIEWS_MSG_TEMPLATE.format(review_count=review_count),
+            "message": REVIEWS_MSG_TEMPLATE,
         }
 
     # CHECK 4 — Rating
@@ -122,7 +116,7 @@ def run_qualification_checks(gmb_data: dict) -> dict:
             "action_required": "send_message",
             "failed_check": "rating",
             "end_conversation": True,
-            "message": RATING_MSG_TEMPLATE.format(rating=rating),
+            "message": RATING_MSG_TEMPLATE,
         }
 
     # All checks passed
@@ -157,7 +151,12 @@ def do_check(inp: dict) -> dict:
 
 def do_recheck(api_key: str, inp: dict) -> dict:
     """Re-fetch fresh GMB data and re-run all four qualification checks."""
-    place_id = inp.get("place_id", "").strip()
+    # Accept place_id at top level OR nested inside gmb_data (agent sometimes nests it)
+    place_id = (inp.get("place_id") or "").strip()
+    if not place_id:
+        gmb_data_nested = inp.get("gmb_data") or {}
+        if isinstance(gmb_data_nested, dict):
+            place_id = (gmb_data_nested.get("place_id") or "").strip()
     if not place_id:
         return {"error": "Provide place_id (Google Place ID, e.g. 'ChIJ...') for recheck."}
 
@@ -185,18 +184,17 @@ try:
     inp = json.loads(os.environ.get("INPUT_JSON", "{}"))
     action = inp.get("action", "").strip()
 
-    if action == "check":
-        result = do_check(inp)
-    elif action == "recheck":
+    if action in ("check", "recheck", ""):
+        # Always fetch fresh data from Google Places — never trust LLM-supplied gmb_data
         if not api_key:
-            result = {"error": "GOOGLE_PLACES_API_KEY environment variable is not set. Required for recheck action."}
+            result = {"error": "GOOGLE_PLACES_API_KEY environment variable is not set."}
         else:
             result = do_recheck(api_key, inp)
     else:
         result = {
             "error": (
                 f"Unknown action: '{action}'. "
-                "Available actions: 'check' (use existing gmb_data), 'recheck' (fetch fresh data by place_id)."
+                "Use action='recheck' with place_id to run qualification checks."
             )
         }
 
