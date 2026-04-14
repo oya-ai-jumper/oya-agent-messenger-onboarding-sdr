@@ -182,6 +182,11 @@
   ],
   "gateways": [
     {
+      "platform": "facebook-messenger",
+      "name": "Facebook messenger",
+      "is_active": true
+    },
+    {
       "platform": "browser",
       "name": "Browser \u2014 Cloud sandbox",
       "is_active": true
