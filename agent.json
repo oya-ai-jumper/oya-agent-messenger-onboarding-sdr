@@ -185,11 +185,6 @@
       "platform": "browser",
       "name": "Browser \u2014 Cloud sandbox",
       "is_active": true
-    },
-    {
-      "platform": "facebook-messenger",
-      "name": "Facebook Messenger App Connection",
-      "is_active": true
     }
   ],
   "routines": [],
