@@ -118,11 +118,40 @@ def mcp_call_tool(stream_url, tool_name, arguments, api_key=None, timeout=30):
         if r.status_code >= 400:
             raise Exception(f"MCP initialize error {r.status_code}: {r.content.decode('utf-8', errors='replace')[:400]}")
 
-        # Extract mcp-session-id — required by Xano for all subsequent requests
-        session_id = r.headers.get("mcp-session-id", "")
-        session_headers = {**headers, "mcp-session-id": session_id}
+        # Extract mcp-session-id — Xano returns it as a response header.
+        # Try all known header name variations (Xano has used different casings).
+        session_id = (
+            r.headers.get("mcp-session-id")
+            or r.headers.get("x-mcp-session-id")
+            or r.headers.get("session-id")
+            or ""
+        )
+        if not session_id:
+            # Fallback: parse from SSE body in case Xano embeds it there
+            for line in r.content.decode("utf-8", errors="replace").splitlines():
+                if line.startswith("data:"):
+                    try:
+                        body = json.loads(line[5:].strip())
+                        session_id = (
+                            body.get("sessionId")
+                            or body.get("session_id")
+                            or body.get("result", {}).get("sessionId", "")
+                        )
+                        if session_id:
+                            break
+                    except (json.JSONDecodeError, ValueError):
+                        pass
 
-        c.post(stream_url, headers=session_headers, json=notif_payload)
+        # Only add the header if we have a non-empty session ID.
+        # Passing an empty mcp-session-id causes Xano to return 400 "Server not initialized".
+        session_headers = {**headers}
+        if session_id:
+            session_headers["mcp-session-id"] = session_id
+
+        rn = c.post(stream_url, headers=session_headers, json=notif_payload)
+        # notifications/initialized may return 200 or 202 — both are valid
+        if rn.status_code >= 400:
+            raise Exception(f"MCP notifications/initialized error {rn.status_code}: {rn.content.decode('utf-8', errors='replace')[:200]}")
 
         r2 = c.post(stream_url, headers=session_headers, json=tool_payload)
         if r2.status_code >= 400:
@@ -309,9 +338,37 @@ def do_reset_session(inp):
     return {"status": "session_cleared", "message": ""}
 
 
+def get_fb_first_name(sender_id: str) -> str:
+    """
+    Fetch the sender's first name from the Facebook Graph API.
+    Checks FB_PAGE_ACCESS_TOKEN, FACEBOOK_PAGE_ACCESS_TOKEN, or PAGE_ACCESS_TOKEN env vars.
+    Returns empty string if unavailable.
+    """
+    token = (
+        os.environ.get("FB_PAGE_ACCESS_TOKEN")
+        or os.environ.get("FACEBOOK_PAGE_ACCESS_TOKEN")
+        or os.environ.get("PAGE_ACCESS_TOKEN")
+        or ""
+    ).strip()
+    if not token or not sender_id:
+        return ""
+    try:
+        url = f"https://graph.facebook.com/v19.0/{sender_id}"
+        with httpx.Client(timeout=5) as c:
+            r = c.get(url, params={"fields": "first_name", "access_token": token})
+            if r.status_code == 200:
+                return r.json().get("first_name", "").strip()
+    except Exception:
+        pass
+    return ""
+
+
 def do_trigger_welcome(inp):
     sender_id = (inp.get("sender_id") or "").strip()
+    # Accept name passed directly, fall back to Graph API lookup
     first_name = (inp.get("lead_first_name") or "").strip()
+    if not first_name and sender_id:
+        first_name = get_fb_first_name(sender_id)
 
     # Always reset session on welcome trigger
     if sender_id:
@@ -328,7 +385,7 @@ def do_trigger_welcome(inp):
             "Hey! I'm Hannah 👋 "
             "Give me your business name. Going to look you up to see if we can help"
         )
-    return {"message": msg}
+    return {"message": msg, "lead_first_name": first_name}
 
 
 def do_gmb_lookup(inp, places_key):
@@ -354,11 +411,7 @@ def do_gmb_lookup(inp, places_key):
     if len(results) == 0:
         return {
             "status": "no_results",
-            "message": (
-                "Hmm, I wasn't able to find that listing on Google. "
-                "Could you double-check the name? It should appear exactly as it does "
-                "when you search your business on Google Maps."
-            ),
+            "message": "Sorry! Couldn't find your profile. What's your business address?",
             "results": [],
         }
 
@@ -380,10 +433,8 @@ def do_gmb_lookup(inp, places_key):
 
         return {
             "status": "one_result",
-            "message": (
-                f"I found this listing — is this yours?\n\n"
-                f"📍 {r['name']}\n{r['address']}"
-            ),
+            # Approved script: show listing details then ask "Is this your business?"
+            "message": f"📍 {r['name']}\n{r['address']}\n\nIs this your business?",
             "results": [r],
         }
 
@@ -665,6 +716,20 @@ try:
     elif action == "get_session":
         sender_id = (inp.get("sender_id") or "").strip()
         result = get_session(sender_id) or {"status": "no_session"}
+
+    elif action == "check_gate":
+        # Returns allow/block based on MAPS trigger or active session.
+        # Called as Rule 0 — if block, agent must send nothing and stop.
+        sender_id = (inp.get("sender_id") or "").strip()
+        message_text = (inp.get("message_text") or "").strip().upper()
+        is_trigger = message_text == "MAPS"
+        session = get_session(sender_id) if sender_id else None
+        step = (session.get("step") or "").strip() if session else ""
+        is_active = step not in ("", "completed", "session_cleared")
+        if is_trigger or is_active:
+            result = {"gate": "allow", "reason": "trigger" if is_trigger else "active_session"}
+        else:
+            result = {"gate": "block", "reason": "no_trigger_no_session"}
 
     elif action == "check_xano_gmb":
         result = do_check_xano_gmb(inp, stream_url, login_link, xano_api_key)
