@@ -20,6 +20,27 @@
   },
   "skills": [
     {
+      "skill_id": "browser",
+      "name": "Oya Browser",
+      "description": "Browse the web, shop on any site, post on X and LinkedIn, fill forms, search, and perform any action in the user's real Chrome browser with their cookies and logins.",
+      "skill_type": "mcp",
+      "category": "browser",
+      "catalog_type": "platform",
+      "config": {},
+      "resource_requirements": [
+        {
+          "name": "Browser API Key",
+          "env_var": "BROWSER_API_KEY",
+          "description": "API key for the browser automation server"
+        },
+        {
+          "name": "Browser API Base URL",
+          "env_var": "BROWSER_API_BASE",
+          "description": "Base URL of the browser automation server"
+        }
+      ]
+    },
+    {
       "skill_id": "current-time",
       "name": "Time & Date Utilities",
       "description": "Get current time, convert timezones, calculate date differences, and more",
@@ -229,7 +250,7 @@
     {
       "platform": "browser",
       "name": "Browser \u2014 Cloud sandbox",
-      "is_active": true
+      "is_active": false
     }
   ],
   "routines": [],
