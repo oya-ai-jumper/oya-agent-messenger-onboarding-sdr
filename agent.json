@@ -229,7 +229,7 @@
     {
       "platform": "browser",
       "name": "Browser \u2014 Cloud sandbox",
-      "is_active": false
+      "is_active": true
     }
   ],
   "routines": [],
