@@ -6,23 +6,19 @@ import psycopg2.extras
 
 def _out(data: dict):
     """Write JSON output directly to stdout fd — safe in ASCII-only oya sandbox."""
+    def _sanitize(obj):
+        if isinstance(obj, str):
+            return obj.encode("ascii", errors="replace").decode("ascii")
+        if isinstance(obj, dict):
+            return {_sanitize(k): _sanitize(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_sanitize(i) for i in obj]
+        return obj
     try:
-        s = json.dumps(data, ensure_ascii=True, default=str)
+        s = json.dumps(_sanitize(data), ensure_ascii=True, default=str)
         os.write(1, (s + "\n").encode("ascii", errors="replace"))
     except Exception:
-        def _sanitize(obj):
-            if isinstance(obj, str):
-                return obj.encode("ascii", errors="replace").decode("ascii")
-            if isinstance(obj, dict):
-                return {_sanitize(k): _sanitize(v) for k, v in obj.items()}
-            if isinstance(obj, list):
-                return [_sanitize(i) for i in obj]
-            return obj
-        try:
-            s = json.dumps(_sanitize(data), default=str)
-            os.write(1, (s + "\n").encode("ascii", errors="replace"))
-        except Exception:
-            os.write(1, b'{"error": "output_failed"}\n')
+        os.write(1, b'{"error": "output_failed"}\n')
 
 XANO_MCP_STREAM = "https://xktx-zdsw-4yq2.n7.xano.io/x2/mcp/hEfoWGi_/mcp/stream"
 RETOOL_DB_URL = os.environ.get(
@@ -101,7 +97,7 @@ def get_email_from_retool(place_id: str = None, address: str = None, name: str =
 # Xano MCP — initialize with session ID, then call get_gmb
 # ---------------------------------------------------------------------------
 
-def xano_get_gmb(api_key: str, email: str, timeout: int = 20) -> dict | None:
+def xano_get_gmb(api_key: str, email: str = None, gmbs_id: int = None, timeout: int = 20) -> dict | None:
     """
     Call Xano get_gmb tool by email.
     Includes mcp-session-id in all requests after initialize — required by Xano MCP server.
@@ -138,12 +134,17 @@ def xano_get_gmb(api_key: str, email: str, timeout: int = 20) -> dict | None:
             "params": {},
         })
 
-        # Step 3: call get_gmb with email — must include session ID
+        # Step 3: call get_gmb with email or gmbs_id — must include session ID
+        args = {}
+        if gmbs_id is not None:
+            args["gmbs_id"] = gmbs_id
+        elif email:
+            args["email"] = email
         r2 = c.post(XANO_MCP_STREAM, headers=session_headers, json={
             "jsonrpc": "2.0",
             "id": 2,
             "method": "tools/call",
-            "params": {"name": "get_gmb", "arguments": {"email": email}},
+            "params": {"name": "get_gmb", "arguments": args},
         })
 
         if r2.status_code != 200:
@@ -185,6 +186,77 @@ def _parse_sse(text: str) -> dict:
 # Main check
 # ---------------------------------------------------------------------------
 
+XANO_DB_URL = os.environ.get(
+    "XANO_DB_URL",
+    "postgresql://read-65b0b3f3:11f1fb678e135b8d357a7196034280b9@34.29.150.25:5432/xano-xktx-zdsw-4yq2-db",
+)
+
+
+def get_gmbs_id_by_place_id(place_id: str) -> int | None:
+    """
+    Query Xano DB to get internal gmbs_id from placeId.
+    Returns gmbs_id integer or None if not found / DB unreachable.
+    """
+    try:
+        conn = psycopg2.connect(XANO_DB_URL, connect_timeout=10)
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    'SELECT id FROM x1_12_gmbs WHERE "placeId" = %s LIMIT 1',
+                    (place_id,),
+                )
+                row = cur.fetchone()
+                return int(row["id"]) if row else None
+        finally:
+            conn.close()
+    except Exception:
+        return None
+
+
+def check_retool_by_place_id(place_id: str = None, address: str = None, name: str = None) -> dict | None:
+    """
+    Query Retool backfill_gmbs_names_and_other directly.
+    Returns {"non_paying": bool} or None if not found.
+    Priority: place_id → address → name.
+    """
+    try:
+        conn = psycopg2.connect(RETOOL_DB_URL, connect_timeout=15)
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                if place_id:
+                    cur.execute(
+                        "SELECT non_paying_client FROM backfill_gmbs_names_and_other "
+                        "WHERE place_id = %s LIMIT 1",
+                        (place_id,),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        return {"non_paying": bool(row["non_paying_client"])}
+                if address:
+                    cur.execute(
+                        "SELECT non_paying_client FROM backfill_gmbs_names_and_other "
+                        "WHERE address ILIKE %s LIMIT 1",
+                        (f"%{address.strip()}%",),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        return {"non_paying": bool(row["non_paying_client"])}
+                if name:
+                    cur.execute(
+                        "SELECT non_paying_client FROM backfill_gmbs_names_and_other "
+                        "WHERE business_name ILIKE %s LIMIT 1",
+                        (f"%{name.strip()}%",),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        return {"non_paying": bool(row["non_paying_client"])}
+        finally:
+            conn.close()
+    except Exception:
+        pass
+    return None
+
+
 def do_check_customer(api_key: str, inp: dict) -> dict:
     place_id = inp.get("place_id", "").strip()
     address = (inp.get("formatted_address") or inp.get("address") or "").strip()
@@ -193,7 +265,18 @@ def do_check_customer(api_key: str, inp: dict) -> dict:
     if not place_id and not address and not name:
         return {"error": "Provide at least one of: place_id, formatted_address, name"}
 
-    # Step 1: resolve email via Retool DB — place_id → address → name
+    # Step 1: query Retool directly by place_id/address/name (primary path — no Xano MCP needed)
+    retool_result = check_retool_by_place_id(
+        place_id=place_id or None,
+        address=address or None,
+        name=name or None,
+    )
+    if retool_result is not None:
+        if not retool_result["non_paying"]:
+            return {"status": "active_customer", "action": "closed", "message": LOGIN_LINK_MESSAGE}
+        return {"status": "expired_customer", "action": "closed", "message": REACTIVATION_LINK_MESSAGE}
+
+    # Step 2: fallback — resolve email via Retool → call Xano MCP
     email = inp.get("email", "").strip() or get_email_from_retool(
         place_id=place_id or None,
         address=address or None,
@@ -201,34 +284,22 @@ def do_check_customer(api_key: str, inp: dict) -> dict:
     )
 
     if not email:
-        # Not in Retool DB — treat as new lead
         return {"status": "new_lead"}
 
-    # Step 2: look up in Xano by email
     try:
-        record = xano_get_gmb(api_key, email)
+        record = xano_get_gmb(api_key, email=email)
     except Exception as e:
         return {"error": str(e)}
 
     if not record:
         return {"status": "new_lead"}
 
-    # Step 3: nonPayingClient = false → active paying customer
-    #         nonPayingClient = true  → previously had account, now canceled
     non_paying = record.get("nonPayingClient", True)
 
     if not non_paying:
-        return {
-            "status": "active_customer",
-            "action": "closed",
-            "message": LOGIN_LINK_MESSAGE,
-        }
+        return {"status": "active_customer", "action": "closed", "message": LOGIN_LINK_MESSAGE}
 
-    return {
-        "status": "expired_customer",
-        "action": "closed",
-        "message": REACTIVATION_LINK_MESSAGE,
-    }
+    return {"status": "expired_customer", "action": "closed", "message": REACTIVATION_LINK_MESSAGE}
 
 
 try:

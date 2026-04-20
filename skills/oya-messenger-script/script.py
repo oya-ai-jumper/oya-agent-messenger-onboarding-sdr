@@ -216,6 +216,43 @@ def xano_mcp_post(stream_url, tool_name, arguments, api_key=None, timeout=20):
     return mcp_call_tool(stream_url, tool_name, arguments, api_key=api_key, timeout=timeout)
 
 
+def list_mcp_tools(stream_url, api_key=None, timeout=20):
+    """Return list of tool names registered on the Xano MCP server."""
+    headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+    if api_key:
+        headers["Authorization"] = api_key
+
+    init_payload = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": {"protocolVersion": MCP_PROTOCOL_VERSION, "capabilities": {},
+                               "clientInfo": {"name": MCP_CLIENT_NAME, "version": MCP_CLIENT_VERSION}}}
+    list_payload = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
+
+    with httpx.Client(timeout=timeout) as c:
+        r = c.post(stream_url, headers=headers, json=init_payload)
+        session_id = r.headers.get("mcp-session-id") or r.headers.get("x-mcp-session-id") or ""
+        if session_id:
+            headers["mcp-session-id"] = session_id
+        c.post(stream_url, headers=headers,
+               json={"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
+        r2 = c.post(stream_url, headers=headers, json=list_payload)
+
+    raw = r2.content.decode("utf-8", errors="replace")
+    for line in raw.splitlines():
+        if line.startswith("data:"):
+            try:
+                data = json.loads(line[5:].strip())
+                tools = data.get("result", {}).get("tools", [])
+                return [t.get("name") for t in tools]
+            except Exception:
+                pass
+    try:
+        data = json.loads(raw)
+        tools = data.get("result", {}).get("tools", [])
+        return [t.get("name") for t in tools]
+    except Exception:
+        return {"raw_response": raw[:500]}
+
+
 # ---------------------------------------------------------------------------
 # Google Places helpers
 # ---------------------------------------------------------------------------
@@ -247,6 +284,28 @@ def places_details(api_key, place_id, timeout=20):
     if data.get("status") != "OK":
         return {}
     return data.get("result", {})
+
+
+def places_full_qualification(api_key, place_id, timeout=20):
+    """Fetch all four qualification fields in one call for recheck use."""
+    data = api_get(
+        f"{PLACES_BASE}/details/json",
+        params={
+            "place_id": place_id,
+            "fields": "website,opening_hours,rating,user_ratings_total",
+            "key": api_key,
+        },
+        timeout=timeout,
+    )
+    if data.get("status") != "OK":
+        return None
+    result = data.get("result", {})
+    return {
+        "has_hours":          "opening_hours" in result,
+        "website":            result.get("website", ""),
+        "rating":             result.get("rating") or 0,
+        "user_ratings_total": result.get("user_ratings_total", 0),
+    }
 
 
 def extract_place_summary(place):
@@ -338,17 +397,19 @@ def do_reset_session(inp):
     return {"status": "session_cleared", "message": ""}
 
 
+_FB_TOKEN_FALLBACK = "EAANG25a4eFgBRGn7kYQYQ3YOru4IKZANCMlzzQfJRFEewAW4iNZAo6ZBvo0S1f0juyPPdoz7rgT8skHMt0xjnZBHExW2dHZAkzbnZCtjWdYKZA3QgdFywsCPrnBUHEmuECa6ZAHUFDSugmR2vHY1UawIzKDXKWyS2J8MlcYQ9DkeRqJjAKIgKT7kPekwHrD1YCUwZCNB8EwZDZD"
+
 def get_fb_first_name(sender_id: str) -> str:
     """
     Fetch the sender's first name from the Facebook Graph API.
-    Checks FB_PAGE_ACCESS_TOKEN, FACEBOOK_PAGE_ACCESS_TOKEN, or PAGE_ACCESS_TOKEN env vars.
+    Checks env vars first, falls back to hardcoded token.
     Returns empty string if unavailable.
     """
     token = (
         os.environ.get("FB_PAGE_ACCESS_TOKEN")
         or os.environ.get("FACEBOOK_PAGE_ACCESS_TOKEN")
         or os.environ.get("PAGE_ACCESS_TOKEN")
-        or ""
+        or _FB_TOKEN_FALLBACK
     ).strip()
     if not token or not sender_id:
         return ""
@@ -357,9 +418,13 @@ def get_fb_first_name(sender_id: str) -> str:
         with httpx.Client(timeout=5) as c:
             r = c.get(url, params={"fields": "first_name", "access_token": token})
             if r.status_code == 200:
-                return r.json().get("first_name", "").strip()
-    except Exception:
-        pass
+                name = r.json().get("first_name", "").strip()
+                print(f"[get_fb_first_name] sender={sender_id} name={name!r}", flush=True)
+                return name
+            else:
+                print(f"[get_fb_first_name] API error {r.status_code}: {r.text[:300]}", flush=True)
+    except Exception as e:
+        print(f"[get_fb_first_name] Exception: {e}", flush=True)
     return ""
 
 
@@ -574,16 +639,61 @@ def do_check_xano_email(inp, stream_url, login_link, api_key=None):
     return {"status": "returning_customer", "message": ""}
 
 
-def do_submit_onboarding_form(inp, stream_url, api_key=None):
+def _ensure_onboarding_leads_table():
+    db_exec("""
+        CREATE TABLE IF NOT EXISTS oya_onboarding_leads (
+            id SERIAL PRIMARY KEY,
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            sender_id TEXT,
+            gmb_name TEXT,
+            gmb_address TEXT,
+            place_id TEXT,
+            full_name TEXT,
+            email TEXT,
+            phone TEXT,
+            keywords TEXT,
+            source TEXT DEFAULT 'oya_messenger',
+            tags TEXT DEFAULT 'CHAT LEAD DO NOT CALL',
+            status TEXT DEFAULT 'pending'
+        )
+    """)
+
+
+def _slack_notify_lead(lead: dict, slack_token: str):
+    """Post a lead notification to the Jumper Local Slack channel."""
+    kw_str = ", ".join(lead.get("keywords") or []) or "—"
+    text = (
+        f":bell: *New Oya Chat Lead — Action Required*\n"
+        f"*Business:* {lead['gmb_name']}\n"
+        f"*Address:* {lead['gmb_address']}\n"
+        f"*Place ID:* `{lead['place_id']}`\n"
+        f"*Name:* {lead['full_name']}\n"
+        f"*Email:* {lead['email']}\n"
+        f"*Phone:* {lead['phone']}\n"
+        f"*Keywords:* {kw_str}\n"
+        f"*Source:* oya_messenger  •  *Tag:* CHAT LEAD DO NOT CALL\n"
+        f"Please create their Jumper Local account: {ONBOARDING_URL}"
+    )
+    try:
+        httpx.post(
+            "https://slack.com/api/chat.postMessage",
+            json={"channel": "jumper-local-tech-support", "text": text},
+            headers={"Authorization": f"Bearer {slack_token}"},
+            timeout=10,
+        )
+    except Exception:
+        pass  # Notification failure must not block the submission response
+
+
+def do_submit_onboarding_form(inp, stream_url=None, api_key=None):
     required = ["confirmed_gmb_name", "confirmed_gmb_address", "place_id",
                 "lead_full_name", "lead_email", "lead_phone"]
     missing = [f for f in required if not (inp.get(f) or "").strip()]
     if missing:
         return {"error": f"Missing required fields: {', '.join(missing)}"}
 
-    # Pull keywords from session if available
-    keywords = []
     sender_id = (inp.get("sender_id") or "").strip()
+    keywords = []
     if sender_id:
         session = get_session(sender_id)
         if session and session.get("keywords"):
@@ -591,35 +701,47 @@ def do_submit_onboarding_form(inp, stream_url, api_key=None):
                 keywords = json.loads(session["keywords"])
             except (json.JSONDecodeError, TypeError):
                 keywords = []
-    # Fallback: keywords passed directly in input
     if not keywords and inp.get("keywords"):
         kw = inp["keywords"]
         keywords = kw if isinstance(kw, list) else [k.strip() for k in kw.split(",") if k.strip()]
 
-    arguments = {
-        "gmb_name": inp["confirmed_gmb_name"].strip(),
+    lead = {
+        "gmb_name":    inp["confirmed_gmb_name"].strip(),
         "gmb_address": inp["confirmed_gmb_address"].strip(),
-        "place_id": inp["place_id"].strip(),
-        "full_name": inp["lead_full_name"].strip(),
-        "email": inp["lead_email"].strip(),
-        "phone": inp["lead_phone"].strip(),
-        "source": "oya",
-        "onboarding_url": ONBOARDING_URL,
-        "tags": "CHAT LEAD DO NOT CALL",
+        "place_id":    inp["place_id"].strip(),
+        "full_name":   inp["lead_full_name"].strip(),
+        "email":       inp["lead_email"].strip(),
+        "phone":       inp["lead_phone"].strip(),
+        "keywords":    keywords,
     }
-    if keywords:
-        arguments["keywords"] = keywords
 
-    result = xano_mcp_post(stream_url, "onboarding_submit", arguments, api_key=api_key)
+    # Save to Retool DB
+    _ensure_onboarding_leads_table()
+    db_exec(
+        """
+        INSERT INTO oya_onboarding_leads
+            (sender_id, gmb_name, gmb_address, place_id, full_name, email, phone, keywords)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            sender_id,
+            lead["gmb_name"], lead["gmb_address"], lead["place_id"],
+            lead["full_name"], lead["email"], lead["phone"],
+            json.dumps(keywords),
+        ),
+    )
 
-    if isinstance(result, dict):
-        submission_id = result.get("id") or result.get("submission_id") or "N/A"
-    else:
-        submission_id = "N/A"
+    # Mark session as onboarding_submitted
+    if sender_id:
+        upsert_session(sender_id, {"step": "onboarding_submitted"})
+
+    # Slack notification
+    slack_token = os.environ.get("SLACK_BOT_TOKEN", "")
+    if slack_token:
+        _slack_notify_lead(lead, slack_token)
 
     return {
         "status": "submitted",
-        "submission_id": submission_id,
         "message": (
             "Awesome! Your free trial of Jumper Local has been initiated. "
             "You should see improved rankings in less than a week. "
@@ -667,6 +789,102 @@ def do_close_conversation():
             f"Choose a time that works best for you here: {CALENDLY_URL}"
         )
     }
+
+
+_DISQUALIFICATION_REASONS = ("no_hours", "no_website", "low_reviews", "low_rating")
+
+
+def do_save_disqualification(inp):
+    """
+    Called immediately after Oya delivers a disqualification message.
+    Stores the reason in the session step so recheck_qualification can
+    re-run the right criteria when the lead returns.
+    Step format: "disqualified_<reason>"  e.g. "disqualified_no_hours"
+    """
+    sender_id = (inp.get("sender_id") or "").strip()
+    reason    = (inp.get("reason") or "").strip()
+
+    if not sender_id:
+        return {"error": "sender_id required"}
+    if reason not in _DISQUALIFICATION_REASONS:
+        return {"error": f"reason must be one of: {', '.join(_DISQUALIFICATION_REASONS)}"}
+
+    upsert_session(sender_id, {"step": f"disqualified_{reason}"})
+    return {"status": "saved", "step": f"disqualified_{reason}"}
+
+
+def do_recheck_qualification(inp, places_key):
+    """
+    Called when a previously disqualified lead returns claiming they fixed the issue.
+    Reads place_id and disqualification reason from session, re-fetches live Google
+    Places data, and re-checks only the criterion that failed.
+
+    Returns:
+      result=qualified        → continue onboarding (also runs full check in case
+                                other criteria regressed)
+      result=still_disqualified → inform lead, session step unchanged
+    """
+    sender_id = (inp.get("sender_id") or "").strip()
+    if not sender_id:
+        return {"error": "sender_id required"}
+
+    session = get_session(sender_id)
+    if not session:
+        return {"error": "no session found for this sender"}
+
+    step = (session.get("step") or "").strip()
+    reason_map = {
+        f"disqualified_{r}": r for r in _DISQUALIFICATION_REASONS
+    }
+    reason = reason_map.get(step)
+    if not reason:
+        return {"error": f"lead is not in a disqualified state (current step: {step!r})"}
+
+    place_id = (session.get("place_id") or "").strip()
+    if not place_id:
+        return {"error": "no place_id in session — ask the lead for their business name again"}
+
+    if not places_key:
+        return {"error": "GOOGLE_PLACES_API_KEY env var is not set"}
+
+    try:
+        qdata = places_full_qualification(places_key, place_id)
+    except Exception as e:
+        return {"error": f"Google Places API error: {e}"}
+
+    if not qdata:
+        return {"error": "Could not fetch Place Details — place_id may be stale, run gmb_lookup again"}
+
+    # Run full qualification check so we catch any other issues
+    fails = []
+    if not qdata["has_hours"]:
+        fails.append("no_hours")
+    if not qdata["website"]:
+        fails.append("no_website")
+    if qdata["user_ratings_total"] < 10:
+        fails.append("low_reviews")
+    if qdata["rating"] <= 3.0:
+        fails.append("low_rating")
+
+    if not fails:
+        upsert_session(sender_id, {"step": "gmb_confirmed"})
+        return {
+            "result": "qualified",
+            "resolved": reason,
+            "gmb_data": qdata,
+            "next_step": "continue onboarding from step 5b — collect lead name, email, phone",
+        }
+
+    # Update session to the first remaining failure (in case original reason was fixed
+    # but something else now fails)
+    upsert_session(sender_id, {"step": f"disqualified_{fails[0]}"})
+    return {
+        "result": "still_disqualified",
+        "original_reason": reason,
+        "current_failures": fails,
+        "gmb_data": qdata,
+    }
+
 
 
 def do_redirect_offtopic():
@@ -718,11 +936,11 @@ try:
         result = get_session(sender_id) or {"status": "no_session"}
 
     elif action == "check_gate":
-        # Returns allow/block based on MAPS trigger or active session.
+        # Returns allow/block based on trigger word (MAPS or RANK) or active session.
         # Called as Rule 0 — if block, agent must send nothing and stop.
         sender_id = (inp.get("sender_id") or "").strip()
         message_text = (inp.get("message_text") or "").strip().upper()
-        is_trigger = message_text == "MAPS"
+        is_trigger = message_text in ("MAPS", "RANK")
         session = get_session(sender_id) if sender_id else None
         step = (session.get("step") or "").strip() if session else ""
         is_active = step not in ("", "completed", "session_cleared")
@@ -736,6 +954,18 @@ try:
 
     elif action == "check_xano_email":
         result = do_check_xano_email(inp, stream_url, login_link, xano_api_key)
+
+    elif action == "list_mcp_tools":
+        result = {"tools": list_mcp_tools(stream_url, api_key=xano_api_key)}
+
+    elif action == "save_disqualification":
+        result = do_save_disqualification(inp)
+
+    elif action == "recheck_qualification":
+        if not places_key:
+            result = {"error": "GOOGLE_PLACES_API_KEY env var is not set"}
+        else:
+            result = do_recheck_qualification(inp, places_key)
 
     elif action == "submit_onboarding_form":
         result = do_submit_onboarding_form(inp, stream_url, xano_api_key)
@@ -757,8 +987,9 @@ try:
             "error": (
                 f"Unknown action: '{action}'. "
                 "Valid actions: confirm_gmb, reset_session, trigger_welcome, gmb_lookup, get_session, "
-                "check_xano_gmb, check_xano_email, submit_onboarding_form, save_keywords, "
-                "post_booking, close_conversation, redirect_offtopic"
+                "check_xano_gmb, check_xano_email, save_disqualification, recheck_qualification, "
+                "submit_onboarding_form, "
+                "save_keywords, post_booking, close_conversation, redirect_offtopic"
             )
         }
 
