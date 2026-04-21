@@ -249,6 +249,11 @@
     },
     {
       "platform": "facebook-messenger",
+      "name": "FB Oya Messenger App",
+      "is_active": true
+    },
+    {
+      "platform": "facebook-messenger",
       "name": "Facebook messenger",
       "is_active": false
     },
