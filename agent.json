@@ -255,7 +255,7 @@
     {
       "platform": "facebook-messenger",
       "name": "FB OYA App",
-      "is_active": true
+      "is_active": false
     }
   ],
   "routines": [],
