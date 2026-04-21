@@ -440,16 +440,11 @@ def do_trigger_welcome(inp):
         delete_session(sender_id)
         upsert_session(sender_id, {"step": "awaiting_gmb_name"})
 
-    if first_name:
-        msg = (
-            f"Hey {first_name}! I'm Hannah 👋 "
-            "Give me your business name. Going to look you up to see if we can help"
-        )
-    else:
-        msg = (
-            "Hey! I'm Hannah 👋 "
-            "Give me your business name. Going to look you up to see if we can help"
-        )
+    name = first_name if first_name else "there"
+    msg = (
+        f"Hey {name}! I'm Hannah 👋 "
+        "Give me your business name. Going to look you up to see if we can help"
+    )
     return {"message": msg, "lead_first_name": first_name}
 
 
@@ -986,10 +981,11 @@ try:
         result = {
             "error": (
                 f"Unknown action: '{action}'. "
-                "Valid actions: confirm_gmb, reset_session, trigger_welcome, gmb_lookup, get_session, "
-                "check_xano_gmb, check_xano_email, save_disqualification, recheck_qualification, "
-                "submit_onboarding_form, "
-                "save_keywords, post_booking, close_conversation, redirect_offtopic"
+                "Valid actions: reset_session, trigger_welcome, gmb_lookup, confirm_gmb, check_gate, "
+                "save_disqualification, recheck_qualification, "
+                "submit_onboarding_form, save_keywords, post_booking, redirect_offtopic. "
+                "NOTE: Lead info (name/email/phone) is collected via direct conversation — no skill call needed. "
+                "Call submit_onboarding_form only after all three are collected."
             )
         }
 

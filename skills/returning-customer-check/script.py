@@ -4,21 +4,6 @@ import httpx
 import psycopg2
 import psycopg2.extras
 
-def _out(data: dict):
-    """Write JSON output directly to stdout fd — safe in ASCII-only oya sandbox."""
-    def _sanitize(obj):
-        if isinstance(obj, str):
-            return obj.encode("ascii", errors="replace").decode("ascii")
-        if isinstance(obj, dict):
-            return {_sanitize(k): _sanitize(v) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [_sanitize(i) for i in obj]
-        return obj
-    try:
-        s = json.dumps(_sanitize(data), ensure_ascii=True, default=str)
-        os.write(1, (s + "\n").encode("ascii", errors="replace"))
-    except Exception:
-        os.write(1, b'{"error": "output_failed"}\n')
 
 XANO_MCP_STREAM = "https://xktx-zdsw-4yq2.n7.xano.io/x2/mcp/hEfoWGi_/mcp/stream"
 RETOOL_DB_URL = os.environ.get(
@@ -315,7 +300,7 @@ try:
     else:
         result = {"error": f"Unknown action '{action}'. Available actions: check_customer"}
 
-    _out(result)
+    print(json.dumps(result, default=str))
 
 except Exception as e:
-    _out({"error": str(e)})
+    print(json.dumps({"error": str(e)}))
