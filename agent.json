@@ -254,8 +254,8 @@
     },
     {
       "platform": "facebook-messenger",
-      "name": "Facebook messenger",
-      "is_active": false
+      "name": "Oya FB APP",
+      "is_active": true
     }
   ],
   "routines": [],
