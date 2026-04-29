@@ -16,7 +16,7 @@ fun main() = runBlocking {
     )
     val completion = openai.chatCompletion(
         ChatCompletionRequest(
-            model = ModelId("gemini/gemini-3-flash-preview"),
+            model = ModelId("anthropic/claude-haiku-4-5-20251001"),
             messages = listOf(ChatMessage(role = ChatRole.User, content = "Hello"))
         )
     )

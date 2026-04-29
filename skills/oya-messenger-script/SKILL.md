@@ -1,101 +1,57 @@
 ---
 name: oya-messenger-script
-display_name: "Oya Messenger Conversation Script"
-description: "Master controller for Oya's live Instagram Messenger onboarding conversations — orchestrates GMB lookup, qualification, returning/current customer checks, lead info collection, onboarding form submission, and conversation close in strict script order"
+display_name: "Messenger Onboarding SDR"
+description: "End-to-end Facebook Messenger onboarding for Jumper Local — single LLM-facing tool that drives the full SDR script as a Python state machine."
 category: sales
 icon: message-circle
 skill_type: sandbox
 catalog_type: addon
-requirements: "httpx>=0.25"
-resource_requirements:
-  - env_var: XANO_MCP_STREAM_URL
-    name: "Xano MCP Stream URL"
-    description: "Xano MCP server stream endpoint (e.g. https://xktx-zdsw-4yq2.n7.xano.io/x2/mcp/hEfoWGi_/mcp/stream)"
-  - env_var: XANO_MCP_SSE_URL
-    name: "Xano MCP SSE URL"
-    description: "Xano MCP server SSE endpoint (e.g. https://xktx-zdsw-4yq2.n7.xano.io/x2/mcp/hEfoWGi_/mcp/sse)"
-  - env_var: GOOGLE_PLACES_API_KEY
-    name: "Google Places API Key"
-    description: "Google Cloud API key with Places API enabled, used for GMB lookup"
-  - env_var: ONBOARDING_LOGIN_LINK
-    name: "Onboarding Login Link"
-    description: "URL to send existing customers to log in (e.g. https://local.jumpermedia.co/login)"
-tool_schema:
-  name: oya-messenger-script
-  description: "Master controller for Oya's Instagram Messenger onboarding script. Handles conversation state, orchestrates sub-skill calls, and returns the exact message Oya should send next plus any action directives."
-  parameters:
-    type: object
-    properties:
-      action:
-        type: "string"
-        description: "Which script operation to perform"
-        enum:
-          - trigger_welcome
-          - gmb_lookup
-          - confirm_gmb
-          - check_xano_gmb
-          - check_xano_email
-          - run_qualification
-          - collect_lead_info
-          - submit_onboarding_form
-          - close_conversation
-          - redirect_offtopic
-      lead_first_name:
-        type: "string"
-        description: "Lead's first name from Messenger profile (optional, omit if unavailable)"
-        default: ""
-      gmb_name_raw:
-        type: "string"
-        description: "Full assembled GMB business name as typed by the lead (used in gmb_lookup)"
-        default: ""
-      gmb_address_hint:
-        type: "string"
-        description: "Address provided by lead to disambiguate multiple GMB results (optional)"
-        default: ""
-      place_id:
-        type: "string"
-        description: "Google Places place_id of the confirmed GMB listing"
-        default: ""
-      confirmed_gmb_name:
-        type: "string"
-        description: "Business name exactly as returned by Google Places API"
-        default: ""
-      confirmed_gmb_address:
-        type: "string"
-        description: "Full address exactly as returned by Google Places API"
-        default: ""
-      lead_full_name:
-        type: "string"
-        description: "Lead's full name collected in Step 5"
-        default: ""
-      lead_email:
-        type: "string"
-        description: "Lead's email address collected in Step 5"
-        default: ""
-      lead_phone:
-        type: "string"
-        description: "Lead's phone number with country code collected in Step 5"
-        default: ""
-      confirmation_text:
-        type: "string"
-        description: "The lead's message when confirming their GMB listing (e.g. 'yes', 'yep', 'that's it')"
-        default: ""
-    required: [action]
+requirements: "httpx>=0.25, psycopg2-binary>=2.9"
+entry_point: "scripts/script.py"
 ---
-# Oya Messenger Conversation Script
+# Messenger Onboarding SDR
 
-Master controller for **Oya's** live Instagram Messenger onboarding conversations at Jumper Media. Orchestrates the full script in strict order: welcome → GMB lookup → returning/current customer check → qualification → lead info collection → onboarding form → close.
+Single-tool skill that owns the entire Facebook Messenger onboarding flow. The parent agent calls `handle_message` once per inbound and sends the returned `reply` verbatim. All flow logic, verbatim copy, qualification thresholds, and integrations live inside this skill.
 
-Xano is accessed via MCP server endpoints:
-- Stream: `https://xktx-zdsw-4yq2.n7.xano.io/x2/mcp/hEfoWGi_/mcp/stream`
-- SSE: `https://xktx-zdsw-4yq2.n7.xano.io/x2/mcp/hEfoWGi_/mcp/sse`
+## CRITICAL — How to relay output to the parent agent
 
----
+The script returns JSON of the form `{"reply": "<exact text>", "step": "..."}`.
 
-## Actions
+When you (the standalone executor) receive this, your response to the parent agent MUST be the **exact `reply` text verbatim** — no paraphrasing, no quotes around it, no preamble like "The tool returned:". If `reply` is empty string, respond with the literal token `<<SILENT>>` so the parent knows to send nothing. If the script returns `{"error": "..."}`, respond with `<<SILENT>>` (do not surface technical errors to the lead).
 
-### trigger_welcome
-Send the opening welcome message the moment a lead sends **RANK**.
+## Tool
 
-**Parameters:** `lead_first_name` (optional)
-**Returns:** `message` — the exact text Oya should send.
+`handle_message(action="handle_message", sender_id, message_text, lead_first_name?)`
+
+- `sender_id` — the lead'\''s real Messenger PSID. Never use `default_user`.
+- `message_text` — the exact text the lead just sent.
+- `lead_first_name` — first name from FB profile if available, else empty string.
+
+## Activation
+
+Only triggers on `MAPS` (case-insensitive) or an active session for the PSID. Other first-time messages return `{"reply": ""}`.
+
+## State machine
+
+| Step | Sends | Expects |
+|---|---|---|
+| `new` | — | MAPS |
+| `welcome_sent` | welcome | GMB name |
+| `gmb_proposed` | "X at Y. Is this your business?" | yes/no |
+| `awaiting_address` | ask for address | address |
+| `collecting_full_name` | ask for full name | name |
+| `collecting_email` | ask for email | email |
+| `collecting_phone` | ask for phone | phone |
+| `awaiting_booking` | book-the-call message | (Calendly webhook) |
+| `completed` | post-booking video message | — |
+| `disqualified_*` / `returning_*_sent` | terminal — only `MAPS` reopens | — |
+
+## Files
+
+- `scripts/script.py` — entry, dispatches `handle_message`
+- `scripts/handler.py` — orchestrator (state machine)
+- `scripts/state.py` — SQLite session store
+- `scripts/messages.py` — YAML loader for assets/messages.yaml + assets/urls.yaml
+- `scripts/_legacy.py` — lower-level integrations (Google Places, Xano MCP, Slack, FB Graph)
+- `assets/messages.yaml`, `assets/urls.yaml`, `assets/flow.yaml`
+- `references/spec.md`, `references/persona.md`, `references/objections.md`

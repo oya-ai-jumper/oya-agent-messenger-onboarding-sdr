@@ -1,3 +1,688 @@
+# --- scripts/script.py ---
+"""Entry point for the messenger-onboarding skill.
+
+Reads INPUT_JSON, dispatches to either:
+  • handle_message (the LLM-facing orchestrator in handler.py — the ONLY
+    tool exposed in tool_schema), or
+  • a legacy `do_*` action (kept for debugging via direct API calls; not
+    surfaced to the agent).
+
+Stdout is a single JSON line with the result, per the sandbox protocol.
+"""
+
+import io
+import json
+import os
+import sys
+
+# Force UTF-8 stdout — the Daytona sandbox defaults to ASCII.
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+
+import handler  # noqa: E402  — imports messages, state, _legacy
+from _legacy import (  # noqa: E402
+    do_confirm_gmb,
+    do_reset_session,
+    do_trigger_welcome,
+    do_gmb_lookup,
+    get_session,
+    do_check_xano_gmb,
+    do_check_xano_email,
+    list_mcp_tools,
+    do_save_disqualification,
+    do_recheck_qualification,
+    do_submit_onboarding_form,
+    do_save_keywords,
+    do_post_booking,
+    do_close_conversation,
+    do_redirect_offtopic,
+)
+
+
+def _env_str(*names: str, default: str = "") -> str:
+    for n in names:
+        v = os.environ.get(n)
+        if v:
+            return v
+    return default
+
+
+def _dispatch(inp: dict) -> dict:
+    action = (inp.get("action") or "").strip()
+
+    if action == "handle_message":
+        return handler.handle_message(
+            sender_id=inp.get("sender_id") or "",
+            message_text=inp.get("message_text") or "",
+            lead_first_name=inp.get("lead_first_name") or "",
+        )
+
+    if action == "post_booking_webhook":
+        return handler.post_booking(sender_id=inp.get("sender_id") or "")
+
+    # ---- Legacy/debug actions (not in tool_schema) ----------------------
+    places_key = os.environ.get("GOOGLE_PLACES_API_KEY", "")
+    _xano_default = "https://xktx-zdsw-4yq2.n7.xano.io/x2/mcp/hEfoWGi_/mcp/stream"
+    stream_url = _env_str(
+        "XANO_MCP_STREAM_URL", "XANO_MCP_STREAM", default=_xano_default
+    ).rstrip("/")
+    if not stream_url.startswith(("http://", "https://")):
+        stream_url = _xano_default
+    xano_api_key = os.environ.get("XANO_MCP_API_KEY", "").strip()
+    login_link = os.environ.get("ONBOARDING_LOGIN_LINK", "https://local.jumpermedia.co/signin")
+
+    if action == "confirm_gmb":
+        return do_confirm_gmb(inp)
+    if action == "reset_session":
+        return do_reset_session(inp)
+    if action == "trigger_welcome":
+        return do_trigger_welcome(inp)
+    if action == "gmb_lookup":
+        if not places_key:
+            return {"error": "GOOGLE_PLACES_API_KEY env var is not set"}
+        return do_gmb_lookup(inp, places_key)
+    if action == "get_session":
+        sender_id = (inp.get("sender_id") or "").strip()
+        return get_session(sender_id) or {"status": "no_session"}
+    if action == "check_gate":
+        # Legacy gate kept for backward compat. New flow uses handle_message.
+        sender_id = (inp.get("sender_id") or "").strip()
+        message_text = (inp.get("message_text") or "").strip().upper()
+        is_trigger = message_text == "MAPS"
+        sess = get_session(sender_id) if sender_id else None
+        step = (sess.get("step") or "").strip() if sess else ""
+        is_active = step not in ("", "completed", "session_cleared")
+        if is_trigger or is_active:
+            return {"gate": "allow", "reason": "trigger" if is_trigger else "active_session"}
+        return {"gate": "block", "reason": "no_trigger_no_session"}
+    if action == "check_xano_gmb":
+        return do_check_xano_gmb(inp, stream_url, login_link, xano_api_key)
+    if action == "check_xano_email":
+        return do_check_xano_email(inp, stream_url, login_link, xano_api_key)
+    if action == "list_mcp_tools":
+        return {"tools": list_mcp_tools(stream_url, api_key=xano_api_key)}
+    if action == "save_disqualification":
+        return do_save_disqualification(inp)
+    if action == "recheck_qualification":
+        if not places_key:
+            return {"error": "GOOGLE_PLACES_API_KEY env var is not set"}
+        return do_recheck_qualification(inp, places_key)
+    if action == "submit_onboarding_form":
+        return do_submit_onboarding_form(inp, stream_url, xano_api_key)
+    if action == "save_keywords":
+        return do_save_keywords(inp)
+    if action == "post_booking":
+        return do_post_booking()
+    if action == "close_conversation":
+        return do_close_conversation()
+    if action == "redirect_offtopic":
+        return do_redirect_offtopic()
+
+    return {
+        "error": (
+            f"Unknown action: '{action}'. "
+            "The agent should call action='handle_message' with sender_id + message_text. "
+            "Other actions are debug-only."
+        )
+    }
+
+
+def main() -> None:
+    # Capture any incidental prints from legacy helpers so they don't pollute
+    # the single JSON line we write at the end (the executor reads stdout).
+    real_stdout = sys.stdout
+    captured = io.StringIO()
+    sys.stdout = captured
+    try:
+        inp = json.loads(os.environ.get("INPUT_JSON", "{}"))
+        result = _dispatch(inp)
+    except Exception as e:
+        result = {"error": str(e)}
+    finally:
+        sys.stdout = real_stdout
+        # Discard captured output from legacy helpers — the standalone-LLM
+        # wrapper around this skill reads stdout+stderr verbatim, and stray
+        # diagnostic prints (FB API warnings etc.) confuse its summary.
+    print(json.dumps(result, default=str, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
+
+
+# --- scripts/handler.py ---
+"""Single-entry orchestrator for the Messenger SDR flow.
+
+The agent's LLM calls `oya-messenger-script` with `action=handle_message`
+and gets back `{reply, step}`. This module owns the entire state machine:
+gate, GMB lookup, qualification, returning-customer check, lead info,
+onboarding submission. All verbatim copy is loaded from assets/messages.yaml.
+
+Lower-level integrations (Google Places, Xano MCP, Retool, Slack, FB Graph)
+live in _legacy.py and are imported below — that file is the previous
+monolithic script.py with the module-level dispatch removed.
+"""
+
+import os
+import re
+
+import state
+import messages
+
+from dfseo import (
+    places_text_search,
+    places_details,
+    places_full_qualification,
+    extract_place_summary,
+)
+from _legacy import (
+    mcp_call_tool,
+    _retool_lookup,
+    _slack_notify_lead,
+    _ensure_onboarding_leads_table,
+    get_fb_first_name,
+)
+
+# ---------------------------------------------------------------------------
+# Pattern matchers
+# ---------------------------------------------------------------------------
+
+_YES_PAT = re.compile(
+    r"^\s*(yes|yep|yeah|yup|y|sure|correct|right|that['s]*\s+(it|us)|confirmed?)\s*[!.]*\s*$",
+    re.IGNORECASE,
+)
+_NO_PAT = re.compile(r"^\s*(no|nope|nah|n|not\s|wrong)\b", re.IGNORECASE)
+_EMAIL_PAT = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+_PHONE_PAT = re.compile(r"^[+\d][\d\s\-().]{6,}$")
+_TRIGGER = "MAPS"
+_TERMINAL_STEPS = {
+    "completed",
+    "session_done",
+    "disqualified_no_website",
+    "disqualified_low_reviews",
+    "disqualified_low_rating",
+    "returning_active_sent",
+    "returning_expired_sent",
+}
+
+
+def _is_yes(s: str) -> bool:
+    return bool(_YES_PAT.match(s or ""))
+
+
+def _is_no(s: str) -> bool:
+    return bool(_NO_PAT.match(s or ""))
+
+
+def _looks_like_email(s: str) -> bool:
+    return bool(_EMAIL_PAT.match((s or "").strip()))
+
+
+def _looks_like_phone(s: str) -> bool:
+    digits = re.sub(r"\D", "", s or "")
+    return len(digits) >= 7 and bool(_PHONE_PAT.match((s or "").strip()))
+
+
+# ---------------------------------------------------------------------------
+# Env access
+# ---------------------------------------------------------------------------
+
+def _places_key() -> str:
+    # Kept for legacy signature compat. DataForSEO uses login/password
+    # (read inside dfseo.py) — not a Google API key.
+    return ""
+
+
+def _xano_stream_url() -> str:
+    default = "https://xktx-zdsw-4yq2.n7.xano.io/x2/mcp/hEfoWGi_/mcp/stream"
+    raw = (os.environ.get("XANO_MCP_STREAM_URL") or os.environ.get("XANO_MCP_STREAM") or default).rstrip("/")
+    return raw if raw.startswith(("http://", "https://")) else default
+
+
+def _xano_api_key() -> str:
+    return os.environ.get("XANO_MCP_API_KEY", "").strip()
+
+
+# ---------------------------------------------------------------------------
+# Sub-flows
+# ---------------------------------------------------------------------------
+
+def _send_welcome(sender_id: str, lead_first_name: str = "") -> dict:
+    state.reset(sender_id)
+    state.upsert(sender_id, step="welcome_sent", last_message=_TRIGGER)
+    first = (lead_first_name or "").strip()
+    if not first:
+        first = (get_fb_first_name(sender_id) or "").strip() if sender_id else ""
+    if first:
+        reply = messages.render("welcome", first_name=first)
+    else:
+        reply = messages.render("welcome_no_name")
+    return {"reply": reply, "step": "welcome_sent"}
+
+
+def _do_gmb_lookup(sender_id: str, gmb_name: str, address_hint: str = "") -> dict:
+    """Search GBPs by name (and address hint), branch on result count."""
+    query = gmb_name if not address_hint else f"{gmb_name} {address_hint}"
+    try:
+        results = places_text_search(query) or []
+    except Exception:
+        return {"reply": messages.render("submission_failed"), "step": "error"}
+    if len(results) == 1:
+        summary = extract_place_summary(results[0])
+        state.upsert(
+            sender_id,
+            step="gmb_proposed",
+            place_id=summary["place_id"],
+            gmb_name=summary["name"],
+            gmb_address=summary["address"],
+        )
+        return {
+            "reply": messages.render(
+                "gmb_one_result",
+                gmb_name=summary["name"],
+                gmb_address=summary["address"],
+            ),
+            "step": "gmb_proposed",
+        }
+    # 0 or many → ask for address (or treat second pass as confirmed)
+    if address_hint and len(results) > 1:
+        # Pick first match after address narrowing
+        summary = extract_place_summary(results[0])
+        state.upsert(
+            sender_id,
+            step="gmb_proposed",
+            place_id=summary["place_id"],
+            gmb_name=summary["name"],
+            gmb_address=summary["address"],
+        )
+        return {
+            "reply": messages.render(
+                "gmb_one_result",
+                gmb_name=summary["name"],
+                gmb_address=summary["address"],
+            ),
+            "step": "gmb_proposed",
+        }
+    state.upsert(sender_id, step="awaiting_address", gmb_name=gmb_name)
+    return {
+        "reply": messages.render("gmb_multiple_results" if results else "gmb_no_results"),
+        "step": "awaiting_address",
+    }
+
+
+def _send_disqual(sender_id: str, reason: str) -> dict:
+    """Persist the failure, return the matching verbatim message, set terminal step."""
+    key_map = {
+        "no_hours": ("disqualified_no_hours", "disqualified_no_hours"),
+        "no_website": ("disqualified_no_website", "disqualified_no_website"),
+        "low_reviews": ("disqualified_low_reviews", "disqualified_low_reviews"),
+        "low_rating": ("disqualified_low_rating", "disqualified_low_rating"),
+    }
+    msg_key, step_id = key_map.get(reason, ("off_topic_redirect", "session_done"))
+    state.upsert(sender_id, step=step_id, disqualification_reason=reason)
+    return {"reply": messages.render(msg_key), "step": step_id}
+
+
+def _check_returning_customer(place_id: str) -> dict:
+    """Look up an existing Jumper Local account by place_id (Retool DB)."""
+    if not place_id:
+        return {"status": "new_lead"}
+    try:
+        info = _retool_lookup(place_id) or {}
+    except Exception:
+        info = {}
+    status = (info.get("status") or "new_lead").lower()
+    return {"status": status, "info": info}
+
+
+def _check_email_existing(email: str) -> str:
+    """Returns 'current_customer' if email matches an active account, else 'new_lead'.
+
+    Wraps the Xano MCP `customer_lookup_by_email` tool. Errors degrade to 'new_lead'
+    so we don't strand a real lead behind an integration hiccup.
+    """
+    if not email:
+        return "new_lead"
+    try:
+        resp = mcp_call_tool(
+            _xano_stream_url(),
+            "customer_lookup_by_email",
+            {"email": email},
+            api_key=_xano_api_key(),
+            timeout=20,
+        )
+        body = resp if isinstance(resp, dict) else {}
+        if (body.get("status") or "").lower() == "active":
+            return "current_customer"
+    except Exception:
+        pass
+    return "new_lead"
+
+
+def _qualify_and_advance(sender_id: str, session: dict) -> dict:
+    """After GMB confirmation: returning-customer check → qualification → next step."""
+    place_id = session.get("place_id") or ""
+    customer = _check_returning_customer(place_id)
+    status = customer.get("status", "new_lead")
+    if status == "active":
+        state.upsert(sender_id, step="returning_active_sent")
+        return {"reply": messages.render("returning_active"), "step": "returning_active_sent"}
+    if status == "expired":
+        state.upsert(sender_id, step="returning_expired_sent")
+        return {"reply": messages.render("returning_expired"), "step": "returning_expired_sent"}
+    # New lead — run qualification
+    qual = places_full_qualification(place_id, _places_key())
+    if not qual.get("pass"):
+        return _send_disqual(sender_id, qual.get("reason", "no_hours"))
+    state.upsert(sender_id, step="collecting_full_name")
+    return {"reply": messages.render("ask_full_name"), "step": "collecting_full_name"}
+
+
+def _submit_onboarding(session: dict) -> dict:
+    """Submit the onboarding form via Xano. Slack-notify on success."""
+    try:
+        _ensure_onboarding_leads_table()
+    except Exception:
+        pass
+    payload = {
+        "place_id": session.get("place_id"),
+        "gmb_name": session.get("gmb_name"),
+        "gmb_address": session.get("gmb_address"),
+        "full_name": session.get("full_name"),
+        "email": session.get("email"),
+        "phone": session.get("phone"),
+        "source": "messenger_sdr",
+    }
+    try:
+        resp = mcp_call_tool(
+            _xano_stream_url(),
+            "onboarding_lead_submit",
+            payload,
+            api_key=_xano_api_key(),
+            timeout=30,
+        )
+        body = resp if isinstance(resp, dict) else {}
+        if body.get("status") == "submitted" or body.get("ok"):
+            try:
+                _slack_notify_lead(payload)
+            except Exception:
+                pass
+            return {"status": "submitted"}
+        return {"status": "error", "raw": body}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# Main entry
+# ---------------------------------------------------------------------------
+
+def handle_message(sender_id: str, message_text: str, lead_first_name: str = "") -> dict:
+    """Single entry point. Returns {reply, step}.
+
+    `reply` is the exact text Hannah should send to the lead. Empty string
+    means "send nothing" (gate blocked or terminal silence). `step` echoes
+    the new session step for observability — the agent does not act on it.
+    """
+    sender_id = (sender_id or "").strip()
+    msg = (message_text or "").strip()
+    msg_upper = msg.upper()
+
+    if not sender_id:
+        return {"reply": "", "step": "missing_sender_id", "error": "sender_id required"}
+
+    session = state.get(sender_id)
+    step = session.get("step", "new")
+
+    # ---- Activation gate -------------------------------------------------
+    # MAPS always resets the session and re-welcomes — even mid-flow. This
+    # is the user explicitly re-triggering the agent.
+    is_trigger = msg_upper == _TRIGGER
+    if is_trigger:
+        return _send_welcome(sender_id, lead_first_name)
+
+    # No trigger and no session → silent (gate blocked).
+    if step == "new":
+        return {"reply": "", "step": step}
+
+    # Terminal sessions: anything other than MAPS is silent.
+    if step in _TERMINAL_STEPS:
+        return {"reply": "", "step": step}
+
+    # Returning disqualified-by-hours lead — recheck on any inbound
+    if step == "disqualified_no_hours":
+        place_id = session.get("place_id") or ""
+        if place_id:
+            qual = places_full_qualification(place_id, _places_key())
+            if qual.get("pass"):
+                state.upsert(sender_id, step="collecting_full_name", disqualification_reason=None)
+                return {"reply": messages.render("ask_full_name"), "step": "collecting_full_name"}
+            return _send_disqual(sender_id, qual.get("reason", "no_hours"))
+        return {"reply": "", "step": step}
+
+    # ---- Mid-flow dispatch ----------------------------------------------
+    if step == "welcome_sent":
+        if "jumper" in msg.lower() and "media" in msg.lower():
+            # Special case: lead self-lookup as Jumper Media itself
+            return {"reply": messages.render("jumper_media_self_lookup"), "step": step}
+        if not msg:
+            return {"reply": messages.render("off_topic_redirect"), "step": step}
+        return _do_gmb_lookup(sender_id, gmb_name=msg)
+
+    if step == "gmb_proposed":
+        if _is_yes(msg):
+            return _qualify_and_advance(sender_id, session)
+        if _is_no(msg):
+            state.upsert(sender_id, step="awaiting_address")
+            return {"reply": messages.render("gmb_multiple_results"), "step": "awaiting_address"}
+        return {"reply": messages.render("off_topic_redirect"), "step": step}
+
+    if step == "awaiting_address":
+        if not msg:
+            return {"reply": messages.render("off_topic_redirect"), "step": step}
+        return _do_gmb_lookup(
+            sender_id,
+            gmb_name=session.get("gmb_name") or "",
+            address_hint=msg,
+        )
+
+    if step == "collecting_full_name":
+        if not msg or len(msg) > 120:
+            return {"reply": messages.render("off_topic_redirect"), "step": step}
+        state.upsert(sender_id, full_name=msg, step="collecting_email")
+        return {"reply": messages.render("ask_email"), "step": "collecting_email"}
+
+    if step == "collecting_email":
+        if not _looks_like_email(msg):
+            return {"reply": messages.render("off_topic_redirect"), "step": step}
+        state.upsert(sender_id, email=msg)
+        if _check_email_existing(msg) == "current_customer":
+            state.upsert(sender_id, step="returning_active_sent")
+            return {"reply": messages.render("returning_active"), "step": "returning_active_sent"}
+        state.upsert(sender_id, step="collecting_phone")
+        return {"reply": messages.render("ask_phone"), "step": "collecting_phone"}
+
+    if step == "collecting_phone":
+        if not _looks_like_phone(msg):
+            return {"reply": messages.render("off_topic_redirect"), "step": step}
+        state.upsert(sender_id, phone=msg)
+        fresh = state.get(sender_id)
+        result = _submit_onboarding(fresh)
+        if result.get("status") == "submitted":
+            state.upsert(sender_id, step="awaiting_booking")
+            return {"reply": messages.render("book_call"), "step": "awaiting_booking"}
+        # Submission failed — keep state but tell the lead a human will follow up.
+        state.upsert(sender_id, step="submission_failed")
+        return {"reply": messages.render("submission_failed"), "step": "submission_failed"}
+
+    if step == "awaiting_booking":
+        # Booking confirmation arrives via Calendly webhook, not lead chat.
+        # Anything the lead sends here is off-topic until then.
+        return {"reply": messages.render("off_topic_redirect"), "step": step}
+
+    # Unknown step — be silent rather than say something wrong.
+    return {"reply": "", "step": step}
+
+
+def post_booking(sender_id: str) -> dict:
+    """Called by the Calendly webhook flow when a booking is confirmed."""
+    sender_id = (sender_id or "").strip()
+    if not sender_id:
+        return {"reply": "", "step": "missing_sender_id"}
+    state.upsert(sender_id, step="completed")
+    return {"reply": messages.render("post_booking"), "step": "completed"}
+
+
+# --- scripts/state.py ---
+"""SQLite session store for the Messenger SDR state machine.
+
+Lives at /home/daytona/_skill/state.db (the sandbox FS persists across runs
+of the same agent). Columns map 1:1 to the orchestrator's working set:
+which step we're on, the confirmed GMB, what's been collected so far.
+"""
+
+import os
+import sqlite3
+from typing import Any
+
+DB_PATH = os.environ.get("MESSENGER_STATE_DB", "/home/daytona/_skill/state.db")
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS sessions (
+    sender_id TEXT PRIMARY KEY,
+    step TEXT NOT NULL DEFAULT 'new',
+    place_id TEXT,
+    gmb_name TEXT,
+    gmb_address TEXT,
+    full_name TEXT,
+    email TEXT,
+    phone TEXT,
+    disqualification_reason TEXT,
+    last_message TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+_FIELDS = (
+    "step", "place_id", "gmb_name", "gmb_address",
+    "full_name", "email", "phone",
+    "disqualification_reason", "last_message",
+)
+
+
+def _connect() -> sqlite3.Connection:
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(_SCHEMA)
+    return conn
+
+
+def get(sender_id: str) -> dict[str, Any]:
+    """Return the session row for sender_id, or a fresh {step: 'new'} stub."""
+    if not sender_id:
+        return {"step": "new"}
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM sessions WHERE sender_id = ?", (sender_id,)
+        ).fetchone()
+    if not row:
+        return {"step": "new", "sender_id": sender_id}
+    return dict(row)
+
+
+def upsert(sender_id: str, **fields: Any) -> dict[str, Any]:
+    """Create or patch the session for sender_id with the given fields.
+
+    Only known columns are written; unknown keys are silently dropped so
+    callers can pass through arbitrary kwargs without a guard.
+    """
+    if not sender_id:
+        raise ValueError("sender_id required")
+    clean = {k: v for k, v in fields.items() if k in _FIELDS}
+    with _connect() as conn:
+        existing = conn.execute(
+            "SELECT 1 FROM sessions WHERE sender_id = ?", (sender_id,)
+        ).fetchone()
+        if existing:
+            if clean:
+                sets = ", ".join(f"{k} = ?" for k in clean) + ", updated_at = CURRENT_TIMESTAMP"
+                conn.execute(
+                    f"UPDATE sessions SET {sets} WHERE sender_id = ?",
+                    (*clean.values(), sender_id),
+                )
+        else:
+            cols = ["sender_id"] + list(clean.keys())
+            placeholders = ", ".join(["?"] * len(cols))
+            conn.execute(
+                f"INSERT INTO sessions ({', '.join(cols)}) VALUES ({placeholders})",
+                (sender_id, *clean.values()),
+            )
+        conn.commit()
+    return get(sender_id)
+
+
+def reset(sender_id: str) -> None:
+    """Drop the session row entirely. Used when a returning lead retriggers MAPS."""
+    if not sender_id:
+        return
+    with _connect() as conn:
+        conn.execute("DELETE FROM sessions WHERE sender_id = ?", (sender_id,))
+        conn.commit()
+
+
+# --- scripts/messages.py ---
+"""Loader for the verbatim copy in assets/messages.yaml + assets/urls.yaml.
+
+Cached at module load. Use render(key, **vars) to produce the final string
+with URL/copy variables interpolated. Returns "" for unknown keys so the
+orchestrator can degrade silently rather than crashing on a typo.
+"""
+
+import os
+import yaml
+
+ASSETS_DIR = os.environ.get("SKILL_ASSETS_DIR", "/home/daytona/_skill/assets")
+
+
+def _load_yaml(path):
+    if not os.path.exists(path):
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        try:
+            data = yaml.safe_load(f) or {}
+        except Exception:
+            return {}
+    return data if isinstance(data, dict) else {}
+
+
+_MESSAGES = _load_yaml(os.path.join(ASSETS_DIR, "messages.yaml"))
+_URLS = _load_yaml(os.path.join(ASSETS_DIR, "urls.yaml"))
+
+
+def render(key, **vars):
+    """Return messages[key] with {placeholders} substituted from urls + vars."""
+    template = _MESSAGES.get(key, "")
+    if not isinstance(template, str) or not template:
+        return ""
+    merged = {**_URLS, **vars}
+    out = template
+    for var_key, value in merged.items():
+        out = out.replace("{" + var_key + "}", str(value))
+    return out.rstrip()
+
+
+def url(key):
+    return _URLS.get(key, "") if isinstance(_URLS, dict) else ""
+
+
+# --- scripts/_legacy.py ---
+"""Legacy helpers extracted from the original monolithic script.py.
+
+The module-level action-dispatch block has been removed; the new entry
+point at scripts/script.py imports from this file via `from _legacy import ...`.
+All function signatures and behaviors are unchanged from the previous version.
+"""
 import os
 import sys
 import io
@@ -7,8 +692,9 @@ import httpx
 import psycopg2
 import psycopg2.extras
 
-# Force UTF-8 stdout — oya sandbox defaults to ASCII
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+# NOTE: stdout wrapping moved to scripts/script.py (the entry point). Doing it
+# here as a module-level side effect re-wraps stdout on every import, which
+# garbage-collects the previous wrapper and closes the underlying buffer.
 
 ONBOARDING_URL = "https://local.jumpermedia.co/onboarding/utm=oya"
 CALENDLY_URL = "https://calendly.com/jmpsales/google-ranking-increase-jumper-local"
@@ -888,108 +1574,168 @@ def do_redirect_offtopic():
     }
 
 
+
+# --- scripts/dfseo.py ---
+"""DataForSEO replacement for Google Places.
+
+Single endpoint — `business_data/google/my_business_info/live` — handles both
+the text search (by `keyword=<business name>`) and the place-by-id lookup
+(by `keyword=place_id:<id>`). Field shape returned by this module matches
+what handler.py used to consume from the Google Places client in _legacy.py.
+
+Auth: DATAFORSEO_LOGIN + DATAFORSEO_PASSWORD (HTTP Basic). No IP allowlist.
+"""
+
+import os
+import json
+from base64 import b64encode
+
+import httpx
+
+BASE = "https://api.dataforseo.com/v3"
+ENDPOINT = "business_data/google/my_business_info/live"
+
+
+def _auth_header():
+    login = (os.environ.get("DATAFORSEO_LOGIN") or "").strip()
+    password = (os.environ.get("DATAFORSEO_PASSWORD") or "").strip()
+    if not login or not password:
+        raise RuntimeError("DATAFORSEO_LOGIN / DATAFORSEO_PASSWORD not configured")
+    token = b64encode(f"{login}:{password}".encode()).decode()
+    return {
+        "Authorization": f"Basic {token}",
+        "Content-Type": "application/json",
+    }
+
+
+def _post(payload, timeout=30):
+    with httpx.Client(timeout=timeout) as c:
+        r = c.post(f"{BASE}/{ENDPOINT}", headers=_auth_header(), json=[payload])
+        if r.status_code >= 400:
+            raise RuntimeError(f"DataForSEO HTTP {r.status_code}: {r.text[:300]}")
+        body = r.json()
+    tasks = body.get("tasks") or []
+    if not tasks:
+        return []
+    task = tasks[0]
+    if task.get("status_code") not in (20000, 20100):
+        msg = task.get("status_message") or "DataForSEO task error"
+        raise RuntimeError(f"DataForSEO task error: {msg}")
+    result = task.get("result") or []
+    if not result:
+        return []
+    return result[0].get("items") or []
+
+
+def _normalize(item):
+    """Convert a DataForSEO GBP item into the dict shape handler.py expects.
+
+    Note: DataForSEO returns `rating` as a nested object
+    {rating_type, value, votes_count, rating_max} — we flatten it here.
+    """
+    rating_obj = item.get("rating") or {}
+    if not isinstance(rating_obj, dict):
+        rating_obj = {}
+    return {
+        "place_id": item.get("place_id") or "",
+        "name": item.get("title") or "",
+        "address": item.get("address") or "",
+        "phone": item.get("phone") or "",
+        "website": item.get("url") or "",
+        "rating": float(rating_obj.get("value") or 0),
+        "review_count": int(rating_obj.get("votes_count") or 0),
+        "work_time": item.get("work_time") or {},
+        "is_claimed": item.get("is_claimed", None),
+        "category": item.get("category") or "",
+        "raw": item,
+    }
+
+
 # ---------------------------------------------------------------------------
-# Main dispatch
+# Public API — drop-in replacements for places_* helpers in _legacy.py
 # ---------------------------------------------------------------------------
 
-try:
-    inp = json.loads(os.environ.get("INPUT_JSON", "{}"))
-    action = (inp.get("action") or "").strip()
+def places_text_search(query, _places_key_unused=""):
+    """Search Google Maps by text. Returns a list of normalized GBP results.
 
-    places_key = os.environ.get("GOOGLE_PLACES_API_KEY", "")
-    _xano_default = "https://xktx-zdsw-4yq2.n7.xano.io/x2/mcp/hEfoWGi_/mcp/stream"
-    stream_url = (
-        os.environ.get("XANO_MCP_STREAM_URL")
-        or os.environ.get("XANO_MCP_STREAM")
-        or _xano_default
-    ).rstrip("/")
-    # Ensure absolute URL — fall back to default if env var is a relative path
-    if not stream_url.startswith(("http://", "https://")):
-        stream_url = _xano_default
-    xano_api_key = os.environ.get("XANO_MCP_API_KEY", "").strip()
-    login_link = os.environ.get(
-        "ONBOARDING_LOGIN_LINK", "https://local.jumpermedia.co/login"
+    Compatibility: signature mirrors _legacy.places_text_search(query, key) —
+    the second arg is ignored. Empty query returns []. The DataForSEO
+    endpoint returns the top match for the keyword (typically 1 item),
+    which is fine for the SDR flow that branches on result count.
+    """
+    q = (query or "").strip()
+    if not q:
+        return []
+    location = os.environ.get("DATAFORSEO_LOCATION", "United States")
+    items = _post({
+        "keyword": q,
+        "location_name": location,
+        "language_code": "en",
+    })
+    return [_normalize(it) for it in items]
+
+
+def places_details(place_id, _places_key_unused=""):
+    """Lookup full GBP detail by place_id. Returns the normalized dict or {}."""
+    pid = (place_id or "").strip()
+    if not pid:
+        return {}
+    location = os.environ.get("DATAFORSEO_LOCATION", "United States")
+    items = _post({
+        "keyword": f"place_id:{pid}",
+        "location_name": location,
+        "language_code": "en",
+    })
+    if not items:
+        return {}
+    return _normalize(items[0])
+
+
+def extract_place_summary(item):
+    """Return {name, address, place_id} from a normalized item."""
+    if not isinstance(item, dict):
+        return {"name": "", "address": "", "place_id": ""}
+    return {
+        "name": item.get("name") or item.get("title") or "",
+        "address": item.get("address") or "",
+        "place_id": item.get("place_id") or "",
+    }
+
+
+def places_full_qualification(place_id, _places_key_unused=""):
+    """Run the SDR qualification check against the GBP at place_id.
+
+    Returns {"pass": bool, "reason": str, "details": {...}}. Reason values
+    line up with the disqualified_* keys in assets/messages.yaml.
+    """
+    info = places_details(place_id)
+    if not info:
+        return {"pass": False, "reason": "no_listing", "details": {}}
+
+    work_time = info.get("work_time") or {}
+    has_hours = bool(
+        work_time.get("work_hours")
+        or work_time.get("timetable")
+        or work_time.get("current_status")
     )
+    has_website = bool((info.get("website") or "").strip())
+    review_count = int(info.get("review_count") or 0)
+    rating = float(info.get("rating") or 0)
 
-    if action == "confirm_gmb":
-        result = do_confirm_gmb(inp)
+    details = {
+        "has_hours": has_hours,
+        "has_website": has_website,
+        "review_count": review_count,
+        "rating": rating,
+    }
 
-    elif action == "reset_session":
-        result = do_reset_session(inp)
-
-    elif action == "trigger_welcome":
-        result = do_trigger_welcome(inp)
-
-    elif action == "gmb_lookup":
-        if not places_key:
-            result = {"error": "GOOGLE_PLACES_API_KEY env var is not set"}
-        else:
-            result = do_gmb_lookup(inp, places_key)
-
-    elif action == "get_session":
-        sender_id = (inp.get("sender_id") or "").strip()
-        result = get_session(sender_id) or {"status": "no_session"}
-
-    elif action == "check_gate":
-        # Returns allow/block based on trigger word (MAPS or RANK) or active session.
-        # Called as Rule 0 — if block, agent must send nothing and stop.
-        sender_id = (inp.get("sender_id") or "").strip()
-        message_text = (inp.get("message_text") or "").strip().upper()
-        is_trigger = message_text in ("MAPS", "RANK")
-        session = get_session(sender_id) if sender_id else None
-        step = (session.get("step") or "").strip() if session else ""
-        is_active = step not in ("", "completed", "session_cleared")
-        if is_trigger or is_active:
-            result = {"gate": "allow", "reason": "trigger" if is_trigger else "active_session"}
-        else:
-            result = {"gate": "block", "reason": "no_trigger_no_session"}
-
-    elif action == "check_xano_gmb":
-        result = do_check_xano_gmb(inp, stream_url, login_link, xano_api_key)
-
-    elif action == "check_xano_email":
-        result = do_check_xano_email(inp, stream_url, login_link, xano_api_key)
-
-    elif action == "list_mcp_tools":
-        result = {"tools": list_mcp_tools(stream_url, api_key=xano_api_key)}
-
-    elif action == "save_disqualification":
-        result = do_save_disqualification(inp)
-
-    elif action == "recheck_qualification":
-        if not places_key:
-            result = {"error": "GOOGLE_PLACES_API_KEY env var is not set"}
-        else:
-            result = do_recheck_qualification(inp, places_key)
-
-    elif action == "submit_onboarding_form":
-        result = do_submit_onboarding_form(inp, stream_url, xano_api_key)
-
-    elif action == "save_keywords":
-        result = do_save_keywords(inp)
-
-    elif action == "post_booking":
-        result = do_post_booking()
-
-    elif action == "close_conversation":
-        result = do_close_conversation()
-
-    elif action == "redirect_offtopic":
-        result = do_redirect_offtopic()
-
-    else:
-        result = {
-            "error": (
-                f"Unknown action: '{action}'. "
-                "Valid actions: reset_session, trigger_welcome, gmb_lookup, confirm_gmb, check_gate, "
-                "save_disqualification, recheck_qualification, "
-                "submit_onboarding_form, save_keywords, post_booking, redirect_offtopic. "
-                "NOTE: Lead info (name/email/phone) is collected via direct conversation — no skill call needed. "
-                "Call submit_onboarding_form only after all three are collected."
-            )
-        }
-
-    print(json.dumps(result, default=str))
-
-except Exception as e:
-    print(json.dumps({"error": str(e)}))
+    # Check in priority order — first failure wins.
+    if not has_hours:
+        return {"pass": False, "reason": "no_hours", "details": details}
+    if not has_website:
+        return {"pass": False, "reason": "no_website", "details": details}
+    if review_count < 10:
+        return {"pass": False, "reason": "low_reviews", "details": details}
+    if rating <= 3.0:
+        return {"pass": False, "reason": "low_rating", "details": details}
+    return {"pass": True, "reason": "qualified", "details": details}

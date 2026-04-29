@@ -4,13 +4,13 @@
 
 ## About
 
-You are Oya, a dedicated AI onboarding specialist exclusively operating within Facebook Messenger and Instagram DMs for Jumper Media. You maintain a warm yet professional and efficient tone, keeping conversations highly focused on the onboarding workflow. You never deviate from the script, avoid offering opinions or unrelated information, and always keep the process moving smoothly. Your expertise is in verifying Google My Business profiles, identifying returning customers, handling qualifications, and guiding new leads through data collection and silent onboarding form submission.
+You are Hannah, an AI onboarding specialist for Jumper Media on Facebook Messenger. The oya-messenger-script skill owns the entire onboarding flow — call it on every inbound message and relay its reply verbatim.
 
 ## Configuration
 
 - **Mode:** skills
 - **Agent ID:** `3291b0eb-5567-41af-8d8f-4526b4da193b`
-- **Model:** `gemini/gemini-3-flash-preview`
+- **Model:** `anthropic/claude-haiku-4-5-20251001`
 
 ## Usage
 
@@ -36,13 +36,13 @@ https://oya.ai/api/v1/chat/completions
 curl -X POST https://oya.ai/api/v1/chat/completions \
   -H "Authorization: Bearer a2a_your_key_here" \
   -H "Content-Type: application/json" \
-  -d '{"model":"gemini/gemini-3-flash-preview","messages":[{"role":"user","content":"Hello"}]}'
+  -d '{"model":"anthropic/claude-haiku-4-5-20251001","messages":[{"role":"user","content":"Hello"}]}'
 
 # Continue a conversation using thread_id from the first response:
 curl -X POST https://oya.ai/api/v1/chat/completions \
   -H "Authorization: Bearer a2a_your_key_here" \
   -H "Content-Type: application/json" \
-  -d '{"model":"gemini/gemini-3-flash-preview","messages":[{"role":"user","content":"Follow up"}],"thread_id":"THREAD_ID"}'
+  -d '{"model":"anthropic/claude-haiku-4-5-20251001","messages":[{"role":"user","content":"Follow up"}],"thread_id":"THREAD_ID"}'
 ```
 
 ### Python
@@ -57,7 +57,7 @@ client = OpenAI(
 
 # First message — starts a new thread
 response = client.chat.completions.create(
-    model="gemini/gemini-3-flash-preview",
+    model="anthropic/claude-haiku-4-5-20251001",
     messages=[{"role": "user", "content": "Hello"}],
 )
 print(response.choices[0].message.content)
@@ -65,7 +65,7 @@ print(response.choices[0].message.content)
 # Continue the conversation using thread_id
 thread_id = response.thread_id
 response = client.chat.completions.create(
-    model="gemini/gemini-3-flash-preview",
+    model="anthropic/claude-haiku-4-5-20251001",
     messages=[{"role": "user", "content": "Follow up question"}],
     extra_body={"thread_id": thread_id},
 )
@@ -84,7 +84,7 @@ const client = new OpenAI({
 
 // First message — starts a new thread
 const response = await client.chat.completions.create({
-  model: "gemini/gemini-3-flash-preview",
+  model: "anthropic/claude-haiku-4-5-20251001",
   messages: [{ role: "user", content: "Hello" }],
 });
 console.log(response.choices[0].message.content);
@@ -92,7 +92,7 @@ console.log(response.choices[0].message.content);
 // Continue the conversation using thread_id
 const threadId = (response as any).thread_id;
 const followUp = await client.chat.completions.create({
-  model: "gemini/gemini-3-flash-preview",
+  model: "anthropic/claude-haiku-4-5-20251001",
   messages: [{ role: "user", content: "Follow up question" }],
   // @ts-ignore — custom field
   thread_id: threadId,
@@ -120,7 +120,7 @@ struct Main {
 
         let query = ChatQuery(
             messages: [.user(.init(content: .string("Hello")))],
-            model: "gemini/gemini-3-flash-preview"
+            model: "anthropic/claude-haiku-4-5-20251001"
         )
         let result = try await withCheckedThrowingContinuation { continuation in
             _ = client.chats(query: query) { continuation.resume(with: $0) }
@@ -151,7 +151,7 @@ fun main() = runBlocking {
     )
     val completion = openai.chatCompletion(
         ChatCompletionRequest(
-            model = ModelId("gemini/gemini-3-flash-preview"),
+            model = ModelId("anthropic/claude-haiku-4-5-20251001"),
             messages = listOf(ChatMessage(role = ChatRole.User, content = "Hello"))
         )
     )
@@ -163,7 +163,7 @@ fun main() = runBlocking {
 
 ```python
 stream = client.chat.completions.create(
-    model="gemini/gemini-3-flash-preview",
+    model="anthropic/claude-haiku-4-5-20251001",
     messages=[{"role": "user", "content": "Tell me about AI agents"}],
     stream=True,
 )
